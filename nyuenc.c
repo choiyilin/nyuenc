@@ -13,7 +13,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define CHUNK_SIZE 65536UL
+#define PARALLEL_CHUNK_SIZE 4096UL
 
 typedef struct {
     unsigned char ch;
@@ -36,9 +36,9 @@ typedef struct {
 
 typedef struct {
     Task *tasks;
-    size_t num_tasks;
-    size_t next_task;
-    size_t completed;
+    size_t *queue;
+    size_t q_head;
+    size_t q_tail;
     bool stop;
     pthread_mutex_t mutex;
     pthread_cond_t has_work;
@@ -125,84 +125,29 @@ static void *worker_main(void *arg) {
     ThreadPool *pool = (ThreadPool *)arg;
 
     for (;;) {
-        size_t idx = 0;
-
         pthread_mutex_lock(&pool->mutex);
-        while (pool->next_task >= pool->num_tasks && !pool->stop) {
+        while (pool->q_head == pool->q_tail && !pool->stop) {
             pthread_cond_wait(&pool->has_work, &pool->mutex);
         }
 
-        if (pool->stop) {
+        if (pool->stop && pool->q_head == pool->q_tail) {
             pthread_mutex_unlock(&pool->mutex);
             break;
         }
 
-        idx = pool->next_task;
-        pool->next_task++;
+        const size_t idx = pool->queue[pool->q_head];
+        pool->q_head++;
         pthread_mutex_unlock(&pool->mutex);
 
         process_task(&pool->tasks[idx]);
 
         pthread_mutex_lock(&pool->mutex);
         pool->tasks[idx].done = true;
-        pool->completed++;
         pthread_cond_broadcast(&pool->has_completion);
         pthread_mutex_unlock(&pool->mutex);
     }
 
     return NULL;
-}
-
-static void encode_sequential(char **files, int file_count) {
-    bool has_pending = false;
-    unsigned char pending_char = 0;
-    size_t pending_count = 0;
-    unsigned char buf[CHUNK_SIZE];
-
-    for (int i = 0; i < file_count; ++i) {
-        FILE *fp = fopen(files[i], "rb");
-        if (fp == NULL) {
-            die("fopen");
-        }
-
-        for (;;) {
-            size_t n = fread(buf, 1, sizeof(buf), fp);
-            if (n == 0) {
-                if (ferror(fp) != 0) {
-                    fclose(fp);
-                    die("fread");
-                }
-                break;
-            }
-
-            for (size_t j = 0; j < n; ++j) {
-                unsigned char ch = buf[j];
-                if (!has_pending) {
-                    pending_char = ch;
-                    pending_count = 1;
-                    has_pending = true;
-                    continue;
-                }
-
-                if (ch == pending_char) {
-                    pending_count++;
-                    continue;
-                }
-
-                emit_run(pending_char, pending_count);
-                pending_char = ch;
-                pending_count = 1;
-            }
-        }
-
-        if (fclose(fp) != 0) {
-            die("fclose");
-        }
-    }
-
-    if (has_pending) {
-        emit_run(pending_char, pending_count);
-    }
 }
 
 static MappedFile map_file(const char *path) {
@@ -256,13 +201,47 @@ static void unmap_file(MappedFile *mf) {
     }
 }
 
+static void encode_sequential(char **files, int file_count) {
+    bool has_pending = false;
+    unsigned char pending_char = 0;
+    size_t pending_count = 0;
+
+    for (int i = 0; i < file_count; ++i) {
+        MappedFile mf = map_file(files[i]);
+        const unsigned char *p = mf.map;
+        for (size_t j = 0; j < mf.size; ++j) {
+            const unsigned char ch = p[j];
+            if (!has_pending) {
+                pending_char = ch;
+                pending_count = 1;
+                has_pending = true;
+                continue;
+            }
+
+            if (ch == pending_char) {
+                pending_count++;
+                continue;
+            }
+
+            emit_run(pending_char, pending_count);
+            pending_char = ch;
+            pending_count = 1;
+        }
+        unmap_file(&mf);
+    }
+
+    if (has_pending) {
+        emit_run(pending_char, pending_count);
+    }
+}
+
 static size_t count_tasks_from_files(const MappedFile *files, int file_count) {
     size_t total = 0;
     for (int i = 0; i < file_count; ++i) {
         if (files[i].size == 0) {
             continue;
         }
-        total += (files[i].size + CHUNK_SIZE - 1U) / CHUNK_SIZE;
+        total += (files[i].size + PARALLEL_CHUNK_SIZE - 1U) / PARALLEL_CHUNK_SIZE;
     }
     return total;
 }
@@ -297,7 +276,8 @@ static void encode_parallel(char **files, int file_count, int num_threads) {
         size_t remaining = mapped[i].size;
         size_t offset = 0;
         while (remaining > 0) {
-            size_t len = remaining > CHUNK_SIZE ? CHUNK_SIZE : remaining;
+            size_t len =
+                remaining > PARALLEL_CHUNK_SIZE ? PARALLEL_CHUNK_SIZE : remaining;
             tasks[idx].data = base + offset;
             tasks[idx].len = len;
             tasks[idx].runs = NULL;
@@ -309,11 +289,16 @@ static void encode_parallel(char **files, int file_count, int num_threads) {
         }
     }
 
+    size_t *task_queue = (size_t *)malloc(num_tasks * sizeof(size_t));
+    if (task_queue == NULL) {
+        die("malloc");
+    }
+
     ThreadPool pool;
     pool.tasks = tasks;
-    pool.num_tasks = num_tasks;
-    pool.next_task = 0;
-    pool.completed = 0;
+    pool.queue = task_queue;
+    pool.q_head = 0;
+    pool.q_tail = 0;
     pool.stop = false;
 
     if (pthread_mutex_init(&pool.mutex, NULL) != 0) {
@@ -338,6 +323,10 @@ static void encode_parallel(char **files, int file_count, int num_threads) {
     }
 
     pthread_mutex_lock(&pool.mutex);
+    for (size_t i = 0; i < num_tasks; ++i) {
+        pool.queue[pool.q_tail] = i;
+        pool.q_tail++;
+    }
     pthread_cond_broadcast(&pool.has_work);
     pthread_mutex_unlock(&pool.mutex);
 
@@ -399,6 +388,7 @@ static void encode_parallel(char **files, int file_count, int num_threads) {
         die("pthread_mutex_destroy");
     }
 
+    free(task_queue);
     free(threads);
     free(tasks);
     for (int i = 0; i < file_count; ++i) {
@@ -407,38 +397,32 @@ static void encode_parallel(char **files, int file_count, int num_threads) {
     free(mapped);
 }
 
-static int parse_threads(int argc, char **argv, int *threads, int *first_file_idx) {
-    *threads = 1;
-    *first_file_idx = 1;
-
-    if (argc >= 3 && strcmp(argv[1], "-j") == 0) {
-        char *end = NULL;
-        long parsed = strtol(argv[2], &end, 10);
-        if (end == argv[2] || *end != '\0' || parsed <= 0 || parsed > 1024) {
-            fprintf(stderr, "Invalid thread count: %s\n", argv[2]);
-            return -1;
-        }
-        *threads = (int)parsed;
-        *first_file_idx = 3;
-    }
-
-    if (*first_file_idx >= argc) {
-        fprintf(stderr, "Usage: %s [-j threads] file1 [file2 ...]\n", argv[0]);
-        return -1;
-    }
-
-    return 0;
-}
-
 int main(int argc, char **argv) {
     int threads = 1;
-    int first_file_idx = 1;
-    if (parse_threads(argc, argv, &threads, &first_file_idx) != 0) {
+    int opt = 0;
+
+    while ((opt = getopt(argc, argv, "j:")) != -1) {
+        if (opt == 'j') {
+            char *end = NULL;
+            const long parsed = strtol(optarg, &end, 10);
+            if (end == optarg || *end != '\0' || parsed <= 0 || parsed > 1024) {
+                fprintf(stderr, "Invalid thread count: %s\n", optarg);
+                return EXIT_FAILURE;
+            }
+            threads = (int)parsed;
+        } else {
+            fprintf(stderr, "Usage: %s [-j threads] file1 [file2 ...]\n", argv[0]);
+            return EXIT_FAILURE;
+        }
+    }
+
+    if (optind >= argc) {
+        fprintf(stderr, "Usage: %s [-j threads] file1 [file2 ...]\n", argv[0]);
         return EXIT_FAILURE;
     }
 
-    char **files = &argv[first_file_idx];
-    int file_count = argc - first_file_idx;
+    char **files = &argv[optind];
+    const int file_count = argc - optind;
 
     if (threads == 1) {
         encode_sequential(files, file_count);

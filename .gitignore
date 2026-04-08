@@ -1,0 +1,4 @@
+*.o
+nyuenc
+*.dSYM/
+*.enc

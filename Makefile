@@ -5,11 +5,8 @@ LDFLAGS=-pthread
 .PHONY: all
 all: nyuenc
 
-nyuenc: nyuenc.o
-	$(CC) $(CFLAGS) -o $@ nyuenc.o $(LDFLAGS)
-
-nyuenc.o: nyuenc.c
-	$(CC) $(CFLAGS) -c nyuenc.c
+nyuenc: nyuenc.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 .PHONY: clean
 clean:

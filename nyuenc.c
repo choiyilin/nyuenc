@@ -13,8 +13,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define PARALLEL_CHUNK_SIZE 4096UL
-#define OUT_BUF_SIZE (1U << 20)
+#define CHUNK 4096UL
+#define OUTSZ (1U << 20)
 
 typedef struct {
     unsigned char ch;
@@ -33,423 +33,402 @@ typedef struct {
     int fd;
     size_t size;
     unsigned char *map;
-} MappedFile;
+} FileMap;
 
 typedef struct {
     Task *tasks;
-    size_t *queue;
-    size_t q_head;
-    size_t q_tail;
-    bool stop;
-    pthread_mutex_t mutex;
-    pthread_cond_t has_work;
-    pthread_cond_t has_completion;
-} ThreadPool;
+    size_t *q;
+    size_t head;
+    size_t tail;
+    bool shutdown;
+    pthread_mutex_t lock;
+    pthread_cond_t cv_work;
+    pthread_cond_t cv_done;
+} Pool;
 
-static void die(const char *msg) {
-    perror(msg);
+typedef struct {
+    int active;
+    unsigned char c;
+    size_t n;
+} Pending;
+
+static struct {
+    unsigned char buf[OUTSZ];
+    size_t used;
+} out;
+
+static void oom(const char *where) {
+    perror(where);
     exit(EXIT_FAILURE);
 }
 
-typedef struct {
-    unsigned char data[OUT_BUF_SIZE];
-    size_t len;
-} OutBuf;
-
-static OutBuf g_stdout_buf;
-
-static void write_all(int fd, const void *buf, size_t count) {
-    const unsigned char *p = (const unsigned char *)buf;
-    size_t left = count;
-    while (left > 0) {
-        ssize_t n = write(fd, p, left);
-        if (n < 0) {
+static void write_full(int fd, const void *v, size_t n) {
+    const unsigned char *p = v;
+    while (n > 0) {
+        ssize_t w = write(fd, p, n);
+        if (w < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            die("write");
+            oom("write");
         }
-        p += (size_t)n;
-        left -= (size_t)n;
+        p += (size_t)w;
+        n -= (size_t)w;
     }
 }
 
-static void stdout_flush(void) {
-    if (g_stdout_buf.len > 0U) {
-        write_all(STDOUT_FILENO, g_stdout_buf.data, g_stdout_buf.len);
-        g_stdout_buf.len = 0;
+static void out_flush(void) {
+    if (out.used == 0) {
+        return;
     }
+    write_full(STDOUT_FILENO, out.buf, out.used);
+    out.used = 0;
 }
 
-static void stdout_append_pair(unsigned char ch, unsigned char cnt) {
-    if (g_stdout_buf.len + 2U > OUT_BUF_SIZE) {
-        stdout_flush();
+static void out_put(unsigned char a, unsigned char b) {
+    if (out.used + 2 > OUTSZ) {
+        out_flush();
     }
-    g_stdout_buf.data[g_stdout_buf.len++] = ch;
-    g_stdout_buf.data[g_stdout_buf.len++] = cnt;
+    out.buf[out.used++] = a;
+    out.buf[out.used++] = b;
 }
 
 static void emit_run(unsigned char ch, size_t count) {
-    while (count > 255U) {
-        stdout_append_pair(ch, 255U);
-        count -= 255U;
+    while (count > 255) {
+        out_put(ch, 255);
+        count -= 255;
     }
-    if (count > 0U) {
-        stdout_append_pair(ch, (unsigned char)count);
+    if (count > 0) {
+        out_put(ch, (unsigned char)count);
     }
 }
 
-static void process_task(Task *task) {
-    if (task->len == 0) {
-        task->runs = NULL;
-        task->run_count = 0;
+static inline void stitch(Pending *p, unsigned char ch, size_t count) {
+    if (!p->active) {
+        p->c = ch;
+        p->n = count;
+        p->active = 1;
+        return;
+    }
+    if (ch == p->c) {
+        p->n += count;
+        return;
+    }
+    emit_run(p->c, p->n);
+    p->c = ch;
+    p->n = count;
+}
+
+static void stitch_flush(Pending *p) {
+    if (p->active) {
+        emit_run(p->c, p->n);
+    }
+}
+
+static void encode_chunk(Task *t) {
+    if (t->len == 0) {
+        t->runs = NULL;
+        t->run_count = 0;
         return;
     }
 
-    Run stack_runs[PARALLEL_CHUNK_SIZE];
-    size_t out_idx = 0;
-    unsigned char current = task->data[0];
-    unsigned int count = 1;
+    Run local[CHUNK];
+    size_t nr = 0;
+    unsigned char cur = t->data[0];
+    unsigned run = 1;
 
-    for (size_t i = 1; i < task->len; ++i) {
-        const unsigned char ch = task->data[i];
-        if (ch == current && count < 255U) {
-            count++;
+    for (size_t i = 1; i < t->len; i++) {
+        unsigned char b = t->data[i];
+        if (b == cur && run < 255) {
+            run++;
             continue;
         }
-
-        stack_runs[out_idx].ch = current;
-        stack_runs[out_idx].count = (unsigned char)count;
-        out_idx++;
-
-        current = ch;
-        count = 1;
+        local[nr].ch = cur;
+        local[nr].count = (unsigned char)run;
+        nr++;
+        cur = b;
+        run = 1;
     }
+    local[nr].ch = cur;
+    local[nr].count = (unsigned char)run;
+    nr++;
 
-    stack_runs[out_idx].ch = current;
-    stack_runs[out_idx].count = (unsigned char)count;
-    out_idx++;
-
-    Run *runs = (Run *)malloc(out_idx * sizeof(Run));
-    if (runs == NULL) {
-        die("malloc");
+    t->runs = malloc(nr * sizeof(Run));
+    if (t->runs == NULL) {
+        oom("malloc");
     }
-    memcpy(runs, stack_runs, out_idx * sizeof(Run));
-    task->runs = runs;
-    task->run_count = out_idx;
+    memcpy(t->runs, local, nr * sizeof(Run));
+    t->run_count = nr;
 }
 
-static void *worker_main(void *arg) {
-    ThreadPool *pool = (ThreadPool *)arg;
+static void *worker(void *vp) {
+    Pool *pool = vp;
 
     for (;;) {
-        pthread_mutex_lock(&pool->mutex);
-        while (pool->q_head == pool->q_tail && !pool->stop) {
-            pthread_cond_wait(&pool->has_work, &pool->mutex);
+        pthread_mutex_lock(&pool->lock);
+        while (pool->head == pool->tail && !pool->shutdown) {
+            pthread_cond_wait(&pool->cv_work, &pool->lock);
         }
-
-        if (pool->stop && pool->q_head == pool->q_tail) {
-            pthread_mutex_unlock(&pool->mutex);
+        if (pool->shutdown && pool->head == pool->tail) {
+            pthread_mutex_unlock(&pool->lock);
             break;
         }
 
-        const size_t idx = pool->queue[pool->q_head];
-        pool->q_head++;
-        pthread_mutex_unlock(&pool->mutex);
+        size_t k = pool->q[pool->head++];
+        pthread_mutex_unlock(&pool->lock);
 
-        process_task(&pool->tasks[idx]);
+        encode_chunk(&pool->tasks[k]);
 
-        pthread_mutex_lock(&pool->mutex);
-        pool->tasks[idx].done = true;
-        pthread_cond_signal(&pool->has_completion);
-        pthread_mutex_unlock(&pool->mutex);
+        pthread_mutex_lock(&pool->lock);
+        pool->tasks[k].done = true;
+        pthread_cond_signal(&pool->cv_done);
+        pthread_mutex_unlock(&pool->lock);
     }
-
     return NULL;
 }
 
-static MappedFile map_file(const char *path) {
-    MappedFile mf;
-    mf.fd = -1;
-    mf.size = 0;
-    mf.map = NULL;
+static FileMap open_mmap(const char *path) {
+    FileMap m;
+    m.fd = -1;
+    m.size = 0;
+    m.map = NULL;
 
-    mf.fd = open(path, O_RDONLY);
-    if (mf.fd < 0) {
-        die("open");
+    m.fd = open(path, O_RDONLY);
+    if (m.fd < 0) {
+        oom("open");
     }
 
     struct stat st;
-    if (fstat(mf.fd, &st) != 0) {
-        close(mf.fd);
-        die("fstat");
+    if (fstat(m.fd, &st) != 0) {
+        close(m.fd);
+        oom("fstat");
     }
     if (st.st_size < 0) {
-        close(mf.fd);
+        close(m.fd);
         errno = EINVAL;
-        die("fstat");
+        oom("fstat");
     }
 
-    mf.size = (size_t)st.st_size;
-    if (mf.size == 0) {
-        return mf;
+    m.size = (size_t)st.st_size;
+    if (m.size == 0) {
+        return m;
     }
 
-    mf.map = mmap(NULL, mf.size, PROT_READ, MAP_PRIVATE, mf.fd, 0);
-    if (mf.map == MAP_FAILED) {
-        close(mf.fd);
-        die("mmap");
+    m.map = mmap(NULL, m.size, PROT_READ, MAP_PRIVATE, m.fd, 0);
+    if (m.map == MAP_FAILED) {
+        close(m.fd);
+        oom("mmap");
     }
-    (void)madvise(mf.map, mf.size, MADV_SEQUENTIAL);
+    (void)madvise(m.map, m.size, MADV_SEQUENTIAL);
 
-    return mf;
+    return m;
 }
 
-static void unmap_file(MappedFile *mf) {
-    if (mf->map != NULL) {
-        if (munmap(mf->map, mf->size) != 0) {
-            die("munmap");
+static void close_mmap(FileMap *m) {
+    if (m->map) {
+        if (munmap(m->map, m->size) != 0) {
+            oom("munmap");
         }
-        mf->map = NULL;
+        m->map = NULL;
     }
-    if (mf->fd >= 0) {
-        if (close(mf->fd) != 0) {
-            die("close");
+    if (m->fd >= 0) {
+        if (close(m->fd) != 0) {
+            oom("close");
         }
-        mf->fd = -1;
+        m->fd = -1;
     }
 }
 
-static void encode_sequential(char **files, int file_count) {
-    bool has_pending = false;
-    unsigned char pending_char = 0;
-    size_t pending_count = 0;
+static void encode_sequential(char **paths, int nfiles) {
+    Pending pend = {0};
 
-    for (int i = 0; i < file_count; ++i) {
-        MappedFile mf = map_file(files[i]);
-        const unsigned char *p = mf.map;
-        for (size_t j = 0; j < mf.size; ++j) {
-            const unsigned char ch = p[j];
-            if (!has_pending) {
-                pending_char = ch;
-                pending_count = 1;
-                has_pending = true;
-                continue;
-            }
-
-            if (ch == pending_char) {
-                pending_count++;
-                continue;
-            }
-
-            emit_run(pending_char, pending_count);
-            pending_char = ch;
-            pending_count = 1;
+    for (int fi = 0; fi < nfiles; fi++) {
+        FileMap m = open_mmap(paths[fi]);
+        for (size_t i = 0; i < m.size; i++) {
+            stitch(&pend, m.map[i], 1);
         }
-        unmap_file(&mf);
+        close_mmap(&m);
     }
 
-    if (has_pending) {
-        emit_run(pending_char, pending_count);
-    }
-    stdout_flush();
+    stitch_flush(&pend);
+    out_flush();
 }
 
-static size_t count_tasks_from_files(const MappedFile *files, int file_count) {
-    size_t total = 0;
-    for (int i = 0; i < file_count; ++i) {
-        if (files[i].size == 0) {
-            continue;
+static size_t chunk_task_count(FileMap *maps, int nfiles) {
+    size_t n = 0;
+    for (int i = 0; i < nfiles; i++) {
+        if (maps[i].size) {
+            n += (maps[i].size + CHUNK - 1) / CHUNK;
         }
-        total += (files[i].size + PARALLEL_CHUNK_SIZE - 1U) / PARALLEL_CHUNK_SIZE;
     }
-    return total;
+    return n;
 }
 
-static void encode_parallel(char **files, int file_count, int num_threads) {
-    MappedFile *mapped = (MappedFile *)calloc((size_t)file_count, sizeof(MappedFile));
-    if (mapped == NULL) {
-        die("calloc");
+static void encode_parallel(char **paths, int nfiles, int nthr) {
+    FileMap *maps = calloc((size_t)nfiles, sizeof(FileMap));
+    if (!maps) {
+        oom("calloc");
     }
 
-    for (int i = 0; i < file_count; ++i) {
-        mapped[i] = map_file(files[i]);
+    for (int i = 0; i < nfiles; i++) {
+        maps[i] = open_mmap(paths[i]);
     }
 
-    const size_t num_tasks = count_tasks_from_files(mapped, file_count);
-    if (num_tasks == 0) {
-        for (int i = 0; i < file_count; ++i) {
-            unmap_file(&mapped[i]);
+    size_t ntask = chunk_task_count(maps, nfiles);
+    if (ntask == 0) {
+        for (int i = 0; i < nfiles; i++) {
+            close_mmap(&maps[i]);
         }
-        free(mapped);
+        free(maps);
         return;
     }
 
-    Task *tasks = (Task *)calloc(num_tasks, sizeof(Task));
-    if (tasks == NULL) {
-        die("calloc");
+    Task *tasks = calloc(ntask, sizeof(Task));
+    if (!tasks) {
+        oom("calloc");
     }
 
-    size_t idx = 0;
-    for (int i = 0; i < file_count; ++i) {
-        const unsigned char *base = mapped[i].map;
-        size_t remaining = mapped[i].size;
-        size_t offset = 0;
-        while (remaining > 0) {
-            size_t len =
-                remaining > PARALLEL_CHUNK_SIZE ? PARALLEL_CHUNK_SIZE : remaining;
-            tasks[idx].data = base + offset;
-            tasks[idx].len = len;
-            tasks[idx].runs = NULL;
-            tasks[idx].run_count = 0;
-            tasks[idx].done = false;
-            idx++;
-            offset += len;
-            remaining -= len;
+    size_t k = 0;
+    for (int fi = 0; fi < nfiles; fi++) {
+        const unsigned char *base = maps[fi].map;
+        size_t left = maps[fi].size;
+        size_t off = 0;
+        while (left) {
+            size_t take = left < CHUNK ? left : CHUNK;
+            tasks[k].data = base + off;
+            tasks[k].len = take;
+            tasks[k].runs = NULL;
+            tasks[k].run_count = 0;
+            tasks[k].done = false;
+            k++;
+            off += take;
+            left -= take;
         }
     }
 
-    size_t *task_queue = (size_t *)malloc(num_tasks * sizeof(size_t));
-    if (task_queue == NULL) {
-        die("malloc");
+    size_t *order = malloc(ntask * sizeof(size_t));
+    if (!order) {
+        oom("malloc");
     }
 
-    ThreadPool pool;
+    Pool pool;
     pool.tasks = tasks;
-    pool.queue = task_queue;
-    pool.q_head = 0;
-    pool.q_tail = 0;
-    pool.stop = false;
+    pool.q = order;
+    pool.head = pool.tail = 0;
+    pool.shutdown = false;
 
-    if (pthread_mutex_init(&pool.mutex, NULL) != 0) {
-        die("pthread_mutex_init");
+    if (pthread_mutex_init(&pool.lock, NULL)) {
+        oom("pthread_mutex_init");
     }
-    if (pthread_cond_init(&pool.has_work, NULL) != 0) {
-        die("pthread_cond_init");
+    if (pthread_cond_init(&pool.cv_work, NULL)) {
+        oom("pthread_cond_init");
     }
-    if (pthread_cond_init(&pool.has_completion, NULL) != 0) {
-        die("pthread_cond_init");
-    }
-
-    pthread_t *threads = (pthread_t *)calloc((size_t)num_threads, sizeof(pthread_t));
-    if (threads == NULL) {
-        die("calloc");
+    if (pthread_cond_init(&pool.cv_done, NULL)) {
+        oom("pthread_cond_init");
     }
 
-    for (int i = 0; i < num_threads; ++i) {
-        if (pthread_create(&threads[i], NULL, worker_main, &pool) != 0) {
-            die("pthread_create");
+    pthread_t *tid = calloc((size_t)nthr, sizeof(pthread_t));
+    if (!tid) {
+        oom("calloc");
+    }
+
+    for (int i = 0; i < nthr; i++) {
+        if (pthread_create(&tid[i], NULL, worker, &pool)) {
+            oom("pthread_create");
         }
     }
 
-    pthread_mutex_lock(&pool.mutex);
-    for (size_t i = 0; i < num_tasks; ++i) {
-        pool.queue[pool.q_tail] = i;
-        pool.q_tail++;
+    pthread_mutex_lock(&pool.lock);
+    for (size_t i = 0; i < ntask; i++) {
+        pool.q[pool.tail++] = i;
     }
-    pthread_cond_broadcast(&pool.has_work);
-    pthread_mutex_unlock(&pool.mutex);
+    pthread_cond_broadcast(&pool.cv_work);
+    pthread_mutex_unlock(&pool.lock);
 
-    bool has_pending = false;
-    unsigned char pending_char = 0;
-    size_t pending_count = 0;
+    Pending pend = {0};
 
-    for (size_t t = 0; t < num_tasks; ++t) {
-        pthread_mutex_lock(&pool.mutex);
+    for (size_t t = 0; t < ntask; t++) {
+        pthread_mutex_lock(&pool.lock);
         while (!tasks[t].done) {
-            pthread_cond_wait(&pool.has_completion, &pool.mutex);
+            pthread_cond_wait(&pool.cv_done, &pool.lock);
         }
-        pthread_mutex_unlock(&pool.mutex);
+        pthread_mutex_unlock(&pool.lock);
 
-        for (size_t r = 0; r < tasks[t].run_count; ++r) {
-            unsigned char ch = tasks[t].runs[r].ch;
-            size_t count = tasks[t].runs[r].count;
-            if (!has_pending) {
-                has_pending = true;
-                pending_char = ch;
-                pending_count = count;
-                continue;
-            }
-            if (ch == pending_char) {
-                pending_count += count;
-                continue;
-            }
-            emit_run(pending_char, pending_count);
-            pending_char = ch;
-            pending_count = count;
+        for (size_t r = 0; r < tasks[t].run_count; r++) {
+            stitch(&pend, tasks[t].runs[r].ch, tasks[t].runs[r].count);
         }
-
         free(tasks[t].runs);
         tasks[t].runs = NULL;
     }
 
-    if (has_pending) {
-        emit_run(pending_char, pending_count);
-    }
-    stdout_flush();
+    stitch_flush(&pend);
+    out_flush();
 
-    pthread_mutex_lock(&pool.mutex);
-    pool.stop = true;
-    pthread_cond_broadcast(&pool.has_work);
-    pthread_mutex_unlock(&pool.mutex);
+    pthread_mutex_lock(&pool.lock);
+    pool.shutdown = true;
+    pthread_cond_broadcast(&pool.cv_work);
+    pthread_mutex_unlock(&pool.lock);
 
-    for (int i = 0; i < num_threads; ++i) {
-        if (pthread_join(threads[i], NULL) != 0) {
-            die("pthread_join");
+    for (int i = 0; i < nthr; i++) {
+        if (pthread_join(tid[i], NULL)) {
+            oom("pthread_join");
         }
     }
 
-    if (pthread_cond_destroy(&pool.has_completion) != 0) {
-        die("pthread_cond_destroy");
+    if (pthread_cond_destroy(&pool.cv_done)) {
+        oom("pthread_cond_destroy");
     }
-    if (pthread_cond_destroy(&pool.has_work) != 0) {
-        die("pthread_cond_destroy");
+    if (pthread_cond_destroy(&pool.cv_work)) {
+        oom("pthread_cond_destroy");
     }
-    if (pthread_mutex_destroy(&pool.mutex) != 0) {
-        die("pthread_mutex_destroy");
+    if (pthread_mutex_destroy(&pool.lock)) {
+        oom("pthread_mutex_destroy");
     }
 
-    free(task_queue);
-    free(threads);
+    free(order);
+    free(tid);
     free(tasks);
-    for (int i = 0; i < file_count; ++i) {
-        unmap_file(&mapped[i]);
+    for (int i = 0; i < nfiles; i++) {
+        close_mmap(&maps[i]);
     }
-    free(mapped);
+    free(maps);
 }
 
 int main(int argc, char **argv) {
-    int threads = 1;
-    int opt = 0;
+    int jobs = 1;
+    int c;
 
-    while ((opt = getopt(argc, argv, "j:")) != -1) {
-        if (opt == 'j') {
+    while ((c = getopt(argc, argv, "j:")) != -1) {
+        switch (c) {
+        case 'j': {
             char *end = NULL;
-            const long parsed = strtol(optarg, &end, 10);
-            if (end == optarg || *end != '\0' || parsed <= 0 || parsed > 1024) {
+            long v = strtol(optarg, &end, 10);
+            if (end == optarg || *end || v <= 0 || v > 1024) {
                 fprintf(stderr, "Invalid thread count: %s\n", optarg);
-                return EXIT_FAILURE;
+                return 1;
             }
-            threads = (int)parsed;
-        } else {
-            fprintf(stderr, "Usage: %s [-j threads] file1 [file2 ...]\n", argv[0]);
-            return EXIT_FAILURE;
+            jobs = (int)v;
+            break;
+        }
+        default:
+            fprintf(stderr, "usage: %s [-j n] file ...\n", argv[0]);
+            return 1;
         }
     }
 
     if (optind >= argc) {
-        fprintf(stderr, "Usage: %s [-j threads] file1 [file2 ...]\n", argv[0]);
-        return EXIT_FAILURE;
+        fprintf(stderr, "usage: %s [-j n] file ...\n", argv[0]);
+        return 1;
     }
 
     char **files = &argv[optind];
-    const int file_count = argc - optind;
+    int nf = argc - optind;
 
-    if (threads == 1) {
-        encode_sequential(files, file_count);
+    if (jobs == 1) {
+        encode_sequential(files, nf);
     } else {
-        encode_parallel(files, file_count, threads);
+        encode_parallel(files, nf, jobs);
     }
 
-    return EXIT_SUCCESS;
+    return 0;
 }

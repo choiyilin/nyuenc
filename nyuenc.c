@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #define PARALLEL_CHUNK_SIZE 4096UL
+#define OUT_BUF_SIZE (1U << 20)
 
 typedef struct {
     unsigned char ch;
@@ -50,6 +51,13 @@ static void die(const char *msg) {
     exit(EXIT_FAILURE);
 }
 
+typedef struct {
+    unsigned char data[OUT_BUF_SIZE];
+    size_t len;
+} OutBuf;
+
+static OutBuf g_stdout_buf;
+
 static void write_all(int fd, const void *buf, size_t count) {
     const unsigned char *p = (const unsigned char *)buf;
     size_t left = count;
@@ -66,19 +74,28 @@ static void write_all(int fd, const void *buf, size_t count) {
     }
 }
 
+static void stdout_flush(void) {
+    if (g_stdout_buf.len > 0U) {
+        write_all(STDOUT_FILENO, g_stdout_buf.data, g_stdout_buf.len);
+        g_stdout_buf.len = 0;
+    }
+}
+
+static void stdout_append_pair(unsigned char ch, unsigned char cnt) {
+    if (g_stdout_buf.len + 2U > OUT_BUF_SIZE) {
+        stdout_flush();
+    }
+    g_stdout_buf.data[g_stdout_buf.len++] = ch;
+    g_stdout_buf.data[g_stdout_buf.len++] = cnt;
+}
+
 static void emit_run(unsigned char ch, size_t count) {
     while (count > 255U) {
-        unsigned char out[2];
-        out[0] = ch;
-        out[1] = 255U;
-        write_all(STDOUT_FILENO, out, sizeof(out));
+        stdout_append_pair(ch, 255U);
         count -= 255U;
     }
     if (count > 0U) {
-        unsigned char out[2];
-        out[0] = ch;
-        out[1] = (unsigned char)count;
-        write_all(STDOUT_FILENO, out, sizeof(out));
+        stdout_append_pair(ch, (unsigned char)count);
     }
 }
 
@@ -89,11 +106,7 @@ static void process_task(Task *task) {
         return;
     }
 
-    Run *runs = (Run *)malloc(task->len * sizeof(Run));
-    if (runs == NULL) {
-        die("malloc");
-    }
-
+    Run stack_runs[PARALLEL_CHUNK_SIZE];
     size_t out_idx = 0;
     unsigned char current = task->data[0];
     unsigned int count = 1;
@@ -105,18 +118,23 @@ static void process_task(Task *task) {
             continue;
         }
 
-        runs[out_idx].ch = current;
-        runs[out_idx].count = (unsigned char)count;
+        stack_runs[out_idx].ch = current;
+        stack_runs[out_idx].count = (unsigned char)count;
         out_idx++;
 
         current = ch;
         count = 1;
     }
 
-    runs[out_idx].ch = current;
-    runs[out_idx].count = (unsigned char)count;
+    stack_runs[out_idx].ch = current;
+    stack_runs[out_idx].count = (unsigned char)count;
     out_idx++;
 
+    Run *runs = (Run *)malloc(out_idx * sizeof(Run));
+    if (runs == NULL) {
+        die("malloc");
+    }
+    memcpy(runs, stack_runs, out_idx * sizeof(Run));
     task->runs = runs;
     task->run_count = out_idx;
 }
@@ -143,7 +161,7 @@ static void *worker_main(void *arg) {
 
         pthread_mutex_lock(&pool->mutex);
         pool->tasks[idx].done = true;
-        pthread_cond_broadcast(&pool->has_completion);
+        pthread_cond_signal(&pool->has_completion);
         pthread_mutex_unlock(&pool->mutex);
     }
 
@@ -182,6 +200,7 @@ static MappedFile map_file(const char *path) {
         close(mf.fd);
         die("mmap");
     }
+    (void)madvise(mf.map, mf.size, MADV_SEQUENTIAL);
 
     return mf;
 }
@@ -233,6 +252,7 @@ static void encode_sequential(char **files, int file_count) {
     if (has_pending) {
         emit_run(pending_char, pending_count);
     }
+    stdout_flush();
 }
 
 static size_t count_tasks_from_files(const MappedFile *files, int file_count) {
@@ -366,6 +386,7 @@ static void encode_parallel(char **files, int file_count, int num_threads) {
     if (has_pending) {
         emit_run(pending_char, pending_count);
     }
+    stdout_flush();
 
     pthread_mutex_lock(&pool.mutex);
     pool.stop = true;
